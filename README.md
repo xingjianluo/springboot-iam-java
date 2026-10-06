@@ -42,6 +42,8 @@ mvn spring-boot:run
   原子地**换发新密文、旧密文立即失效**；`credentialId` 不变、`version` +1。
 - **撤销** `POST /iam/credentials/{credentialId}/revoke`：终态操作，幂等。
 - **访问** `POST /iam/access`：携带密文访问受保护资源。
+- **账号级批量吊销** `POST /iam/accounts/{subject}/revoke-all`：一键结束该账号全部登录，见 §2.4。
+- **账号会话汇总** `GET /iam/accounts/{subject}/sessions`：查看该账号当前登录情况，见 §2.5。
 
 ### 2.1 刷新的并发与失败语义
 
@@ -74,6 +76,51 @@ mvn spring-boot:run
 | 撤销未知 id | `UNKNOWN_CREDENTIAL_ID` | 404 |
 
 凭证认证判定优先级：**存在性 → 撤销 → 过期 → 状态有效**。
+
+### 2.4 账号级批量吊销（一键结束全部登录）
+
+`POST /iam/accounts/{subject}/revoke-all` 把该账号**当前所有仍生效的凭证**一次吊销：
+
+- **覆盖刷新派生的后代凭证**：刷新轮换共用同一 `credentialId` 链，批量吊销按链终止，
+  即使某凭证在交错中刚被刷新出新密文，操作返回后该新密文同样不可用。
+- **已过期 / 已吊销的被识别而非误报**：结果中 `expiredCount` 与 `alreadyRevokedCount`
+  分别统计这两类，不计入本次 `revokedCount`。
+- **原子性（整体成功或整体失败）**：审计写入与状态变更在存储变更锁内串联——
+  **先写审计，审计写不进去则一个凭证都不改**，对外返回 `AUDIT_UNAVAILABLE`（503），
+   绝不留下“吊销一半”的中间态，也不透出底层报错细节。
+- **与并发刷新/访问交错的确定性**：批量吊销与单凭证刷新、撤销共用同一把存储锁。
+  操作**返回之后**：该账号不存在仍可用的凭证（访问一律 401），
+  也不存在“已吊销又被一次刷新重新续期”的窗口（刷新对 REVOKED 一律拒绝）。
+  交错期间已线性化的访问/刷新可能成功，属于返回前的正常竞争。
+- **幂等且可重复**：重复执行结果稳定。账号当前没有有效凭证时返回可区分的
+  `NO_ACTIVE_CREDENTIALS`（404）——这是“没什么可做”的终态反馈，调用方可忽略；
+  而 `AUDIT_UNAVAILABLE`（503）表示系统侧一时不可用，调用方应重试。两者不会混淆。
+- **可辨识标识**：每次批量操作生成 `operationId`，同时写入响应与审计事件
+  （`operation=REVOKE_ALL`），便于事后核对处置是否已收敛。
+
+响应示例：
+
+```json
+{"operationId":"op_…","subject":"alice","revokedCount":2,
+ "alreadyRevokedCount":1,"expiredCount":1,
+ "revokedCredentialIds":["cred_…","cred_…"]}
+```
+
+### 2.5 账号会话汇总（查看当前登录情况）
+
+`GET /iam/accounts/{subject}/sessions` 返回该账号**当前仍生效**的会话清单：
+
+```json
+{"subject":"alice","activeCount":2,
+ "sessions":[{"credentialId":"cred_…","version":1,"issuedAt":…,"expiresAt":…}]}
+```
+
+- 只统计 `ACTIVE` 且未过期的凭证；已吊销、已过期的不在列。
+- 每个会话带 `credentialId + version` 可辨识标识；批量吊销返回后可用本接口确认
+  `activeCount` 收敛为 0。
+- 存储维护 **主体索引**（subject → 该主体全部凭证 id），按主体定位的开销只与
+  该主体名下凭证数相关；查询为**只读快照、不取变更锁**，批量吊销也只在存储锁内做
+  O(该主体凭证数) 的工作——两者都不会长时间卡住正常的访问与刷新。
 
 ---
 
@@ -145,6 +192,8 @@ mvn spring-boot:run
 | `POST /iam/credentials` | 签发凭证，body：`{subject, roles?, ttlMillis?}`（默认 1 小时） |
 | `POST /iam/credentials/refresh` | 刷新轮换，Header：`Authorization: Bearer <secret>` |
 | `POST /iam/credentials/{id}/revoke` | 撤销凭证 |
+| `POST /iam/accounts/{subject}/revoke-all` | 账号级批量吊销（一键结束全部登录） |
+| `GET  /iam/accounts/{subject}/sessions` | 账号当前有效会话汇总 |
 | `POST /iam/access` | 访问判定，body：`{resource, action}`，Header：Bearer |
 | `POST /iam/policies` | 新增/更新策略，body：`{policyId, effect(ALLOW/DENY), resourcePrefix, action, anyOfRoles?, attributeEquals?}` |
 | `POST /iam/subjects` | 设置主体属性，body：`{subject, attributes}` |
@@ -202,6 +251,26 @@ curl -s -XPOST $BASE/test/audit-writable/true
 
 # 查看审计链
 curl -s $BASE/iam/audit
+
+# ---- 账号级批量吊销 ----
+# 同账号再签发一个凭证
+curl -s -XPOST $BASE/iam/credentials -H 'Content-Type: application/json' \
+  -d '{"subject":"alice","roles":["reader"]}'
+# 查看当前登录情况（activeCount=2）
+curl -s $BASE/iam/accounts/alice/sessions
+# 一键结束全部登录（响应含 operationId 与各计数）
+curl -s -XPOST $BASE/iam/accounts/alice/revoke-all
+# 确认收敛（activeCount=0）
+curl -s $BASE/iam/accounts/alice/sessions
+# 重复执行 -> 404 NO_ACTIVE_CREDENTIALS（可忽略，非系统故障）
+curl -i -XPOST $BASE/iam/accounts/alice/revoke-all
+# 审计不可用 -> 503 AUDIT_UNAVAILABLE，且一个凭证都不会被改（整体失败）
+curl -s -XPOST $BASE/iam/credentials -H 'Content-Type: application/json' \
+  -d '{"subject":"bob","roles":["reader"]}'
+curl -s -XPOST $BASE/test/audit-writable/false
+curl -i -XPOST $BASE/iam/accounts/bob/revoke-all
+curl -s -XPOST $BASE/test/audit-writable/true
+curl -s $BASE/iam/accounts/bob/sessions   # activeCount 仍为 1
 ```
 
 ---
@@ -214,12 +283,13 @@ curl -s $BASE/iam/audit
 | `CredentialRevocationRaceTest` | 撤销与 24 路在途访问交错；撤销/刷新 200 次竞态迭代；REVOKED/EXPIRED/INVALID 可区分 |
 | `AuthorizationPolicyTest` | 显式 DENY 优先、默认拒绝、RBAC/ABAC 命中、策略与属性变更按修订边界收敛、依赖故障失败关闭 |
 | `AuditFailureTest` | 审计不可写时失败关闭（503）、拒绝原因不被覆盖、32 路并发审计不丢重且 id 唯一、审计只读不可篡改 |
-| `WebEndToEndTest` | 经 MockMvc 验证各 HTTP 入口状态码与错误码一致、响应不泄露底层细节 |
+| `AccountGovernanceTest` | 批量吊销与并发刷新（100 次竞态迭代）/并发访问交错、重复吊销、无有效凭证、审计不可用整体失败、会话汇总收敛与不阻塞 |
+| `WebEndToEndTest` | 经 MockMvc 验证各 HTTP 入口状态码与错误码一致、响应不泄露底层细节；含批量吊销的 404/503 可区分与原子性 |
 
 测试通过 `ManualClock` 可控推进时间以**确定性地触发过期**，不依赖真实等待；
 日志中会打印每次判定的**输入与判定依据**（`log.info / log.warn`，见 surefire 输出）。
 所有测试均为内存态、不依赖任何外部服务或真实凭据。
 
 ```bash
-mvn -Dtest=CredentialRefreshConcurrencyTest,CredentialRevocationRaceTest,AuthorizationPolicyTest,AuditFailureTest test
+mvn -Dtest=CredentialRefreshConcurrencyTest,CredentialRevocationRaceTest,AuthorizationPolicyTest,AuditFailureTest,AccountGovernanceTest test
 ```

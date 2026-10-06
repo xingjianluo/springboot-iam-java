@@ -1,6 +1,9 @@
 package com.github.xingjianluo.springbootiamjava.web;
 
 import com.github.xingjianluo.springbootiamjava.iam.access.AccessResult;
+import com.github.xingjianluo.springbootiamjava.iam.account.AccountGovernanceService;
+import com.github.xingjianluo.springbootiamjava.iam.account.BatchRevocationResult;
+import com.github.xingjianluo.springbootiamjava.iam.account.SessionSummary;
 import com.github.xingjianluo.springbootiamjava.iam.access.AccessService;
 import com.github.xingjianluo.springbootiamjava.iam.audit.AuditEvent;
 import com.github.xingjianluo.springbootiamjava.iam.audit.AuditService;
@@ -13,10 +16,13 @@ import com.github.xingjianluo.springbootiamjava.iam.model.Policy;
 import com.github.xingjianluo.springbootiamjava.iam.model.PolicyEffect;
 import com.github.xingjianluo.springbootiamjava.iam.model.SubjectAttributes;
 import com.github.xingjianluo.springbootiamjava.web.dto.Dtos.AccessRequest;
+import com.github.xingjianluo.springbootiamjava.web.dto.Dtos.BatchRevocationResponse;
 import com.github.xingjianluo.springbootiamjava.web.dto.Dtos.AccessResponse;
 import com.github.xingjianluo.springbootiamjava.web.dto.Dtos.CredentialView;
 import com.github.xingjianluo.springbootiamjava.web.dto.Dtos.IssueRequest;
 import com.github.xingjianluo.springbootiamjava.web.dto.Dtos.PolicyRequest;
+import com.github.xingjianluo.springbootiamjava.web.dto.Dtos.SessionSummaryResponse;
+import com.github.xingjianluo.springbootiamjava.web.dto.Dtos.SessionViewDto;
 import com.github.xingjianluo.springbootiamjava.web.dto.Dtos.SubjectRequest;
 import java.util.List;
 import java.util.Map;
@@ -39,15 +45,18 @@ public class IamController {
     private final AccessService accessService;
     private final AuthzStore authzStore;
     private final AuditService auditService;
+    private final AccountGovernanceService accountGovernanceService;
 
     public IamController(CredentialService credentialService,
                          AccessService accessService,
                          AuthzStore authzStore,
-                         AuditService auditService) {
+                         AuditService auditService,
+                         AccountGovernanceService accountGovernanceService) {
         this.credentialService = credentialService;
         this.accessService = accessService;
         this.authzStore = authzStore;
         this.auditService = auditService;
+        this.accountGovernanceService = accountGovernanceService;
     }
 
     @PostMapping("/iam/credentials")
@@ -69,6 +78,24 @@ public class IamController {
     public Map<String, Object> revoke(@PathVariable String credentialId) {
         credentialService.revoke(credentialId);
         return Map.of("credentialId", credentialId, "status", "REVOKED");
+    }
+
+    @PostMapping("/iam/accounts/{subject}/revoke-all")
+    public BatchRevocationResponse revokeAll(@PathVariable String subject) {
+        BatchRevocationResult result = accountGovernanceService.revokeAllForSubject(subject);
+        return new BatchRevocationResponse(result.operationId(), result.subject(),
+                result.revokedCount(), result.alreadyRevokedCount(), result.expiredCount(),
+                result.revokedCredentialIds());
+    }
+
+    @GetMapping("/iam/accounts/{subject}/sessions")
+    public SessionSummaryResponse sessions(@PathVariable String subject) {
+        SessionSummary summary = accountGovernanceService.sessionsOf(subject);
+        return new SessionSummaryResponse(summary.subject(), summary.activeCount(),
+                summary.sessions().stream()
+                        .map(v -> new SessionViewDto(v.credentialId(), v.version(),
+                                v.issuedAt(), v.expiresAt()))
+                        .toList());
     }
 
     @PostMapping("/iam/access")

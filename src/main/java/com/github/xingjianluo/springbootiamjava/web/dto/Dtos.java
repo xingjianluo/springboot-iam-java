@@ -38,4 +38,16 @@ public final class Dtos {
 
     public record ErrorResponse(String error, String message) {
     }
+
+    public record BatchRevocationResponse(String operationId, String subject, int revokedCount,
+                                          int alreadyRevokedCount, int expiredCount,
+                                          List<String> revokedCredentialIds) {
+    }
+
+    public record SessionViewDto(String credentialId, long version, long issuedAt, long expiresAt) {
+    }
+
+    public record SessionSummaryResponse(String subject, int activeCount,
+                                         List<SessionViewDto> sessions) {
+    }
 }

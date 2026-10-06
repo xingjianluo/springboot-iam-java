@@ -130,6 +130,72 @@ class WebEndToEndTest {
     }
 
     @Test
+    void accountRevokeAll_overHttp_atomicityAndDistinguishableFailures() throws Exception {
+        postJson("/iam/policies",
+                "{\"policyId\":\"p\",\"effect\":\"ALLOW\",\"resourcePrefix\":\"docs/\",\"action\":\"read\",\"anyOfRoles\":[\"reader\"]}",
+                null);
+
+        // 1) 无有效凭证的账号 -> 404 NO_ACTIVE_CREDENTIALS（可区分，非 5xx）
+        mvc.perform(post("/iam/accounts/ghost/revoke-all"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("NO_ACTIVE_CREDENTIALS"));
+
+        // 2) 签发两个凭证并批量吊销
+        JsonNode c1 = postJson("/iam/credentials",
+                "{\"subject\":\"tina\",\"roles\":[\"reader\"]}", null);
+        JsonNode c2 = postJson("/iam/credentials",
+                "{\"subject\":\"tina\",\"roles\":[\"reader\"]}", null);
+        JsonNode c2v1 = postJson("/iam/credentials/refresh", "", bearer(c2));
+
+        // 吊销前会话汇总：2 个有效会话，带可辨识标识
+        mvc.perform(get("/iam/accounts/tina/sessions"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.activeCount").value(2))
+                .andExpect(jsonPath("$.sessions[0].credentialId").isString())
+                .andExpect(jsonPath("$.sessions[0].version").isNumber());
+
+        JsonNode batch = postJson("/iam/accounts/tina/revoke-all", "", null);
+        org.assertj.core.api.Assertions.assertThat(batch.get("revokedCount").asInt()).isEqualTo(2);
+        org.assertj.core.api.Assertions.assertThat(batch.get("operationId").asText()).isNotBlank();
+
+        // 3) 吊销后：含刷新派生的最新密文，全部 401 CREDENTIAL_REVOKED
+        for (JsonNode cred : new JsonNode[]{c1, c2v1}) {
+            mvc.perform(post("/iam/access").contentType(MediaType.APPLICATION_JSON)
+                            .header("Authorization", bearer(cred))
+                            .content("{\"resource\":\"docs/a\",\"action\":\"read\"}"))
+                    .andExpect(status().isUnauthorized())
+                    .andExpect(jsonPath("$.error").value("CREDENTIAL_REVOKED"));
+        }
+        // 会话汇总收敛为 0
+        mvc.perform(get("/iam/accounts/tina/sessions"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.activeCount").value(0));
+
+        // 4) 重复吊销 -> 404 NO_ACTIVE_CREDENTIALS（幂等且稳定）
+        mvc.perform(post("/iam/accounts/tina/revoke-all"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("NO_ACTIVE_CREDENTIALS"));
+
+        // 5) 审计不可用 -> 503 AUDIT_UNAVAILABLE，且整体失败不留中间态
+        JsonNode u1 = postJson("/iam/credentials",
+                "{\"subject\":\"uma\",\"roles\":[\"reader\"]}", null);
+        mvc.perform(post("/test/audit-writable/false")).andExpect(status().isOk());
+        mvc.perform(post("/iam/accounts/uma/revoke-all"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.error").value("AUDIT_UNAVAILABLE"));
+        mvc.perform(post("/test/audit-writable/true")).andExpect(status().isOk());
+        // 凭证未被吊销（无“吊销一半”的中间态）
+        mvc.perform(get("/iam/accounts/uma/sessions"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.activeCount").value(1));
+        mvc.perform(post("/iam/access").contentType(MediaType.APPLICATION_JSON)
+                        .header("Authorization", bearer(u1))
+                        .content("{\"resource\":\"docs/a\",\"action\":\"read\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.allowed").value(true));
+    }
+
+    @Test
     void malformedPolicy_is400_withSafeMessage() throws Exception {
         mvc.perform(post("/iam/policies").contentType(MediaType.APPLICATION_JSON)
                         .content("{\"policyId\":\"x\"}"))
