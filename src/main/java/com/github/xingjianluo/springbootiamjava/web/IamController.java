@@ -5,6 +5,8 @@ import com.github.xingjianluo.springbootiamjava.iam.access.AccessService;
 import com.github.xingjianluo.springbootiamjava.iam.audit.AuditEvent;
 import com.github.xingjianluo.springbootiamjava.iam.audit.AuditService;
 import com.github.xingjianluo.springbootiamjava.iam.authz.AuthzStore;
+import com.github.xingjianluo.springbootiamjava.iam.credential.AccountSessionSummary;
+import com.github.xingjianluo.springbootiamjava.iam.credential.BulkRevokeResult;
 import com.github.xingjianluo.springbootiamjava.iam.credential.CredentialService;
 import com.github.xingjianluo.springbootiamjava.iam.error.ErrorCode;
 import com.github.xingjianluo.springbootiamjava.iam.error.IamException;
@@ -69,6 +71,16 @@ public class IamController {
     public Map<String, Object> revoke(@PathVariable String credentialId) {
         credentialService.revoke(credentialId);
         return Map.of("credentialId", credentialId, "status", "REVOKED");
+    }
+
+    @PostMapping("/iam/accounts/{subject}/revoke-all")
+    public BulkRevokeResult revokeAllForSubject(@PathVariable String subject) {
+        return credentialService.revokeAllForSubject(subject);
+    }
+
+    @GetMapping("/iam/accounts/{subject}/sessions")
+    public AccountSessionSummary sessionsOf(@PathVariable String subject) {
+        return credentialService.sessionsOf(subject);
     }
 
     @PostMapping("/iam/access")

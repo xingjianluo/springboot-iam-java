@@ -26,6 +26,8 @@ public enum ErrorCode {
     MALFORMED_REQUEST("malformed request", HttpStatus.BAD_REQUEST),
     /** 撤销/查询时引用了不存在的凭证 id。 */
     UNKNOWN_CREDENTIAL_ID("credential id not found", HttpStatus.NOT_FOUND),
+    /** 账号级批量吊销时，该账号名下没有任何凭证可处置（与系统侧不可用可区分，调用方可忽略而非重试）。 */
+    NO_ACTIVE_CREDENTIALS("no credentials found for subject", HttpStatus.NOT_FOUND),
     /** 兜底内部错误，对外不暴露细节。 */
     INTERNAL_ERROR("internal server error", HttpStatus.INTERNAL_SERVER_ERROR);
 

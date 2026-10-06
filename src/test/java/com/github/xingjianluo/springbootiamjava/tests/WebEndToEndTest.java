@@ -136,4 +136,68 @@ class WebEndToEndTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error").value("MALFORMED_REQUEST"));
     }
+
+    @Test
+    void accountLevelGovernance_overHttp() throws Exception {
+        postJson("/iam/policies",
+                "{\"policyId\":\"p\",\"effect\":\"ALLOW\",\"resourcePrefix\":\"docs/\",\"action\":\"read\",\"anyOfRoles\":[\"reader\"]}",
+                null);
+        JsonNode c1 = postJson("/iam/credentials", "{\"subject\":\"pat\",\"roles\":[\"reader\"]}", null);
+        JsonNode c2 = postJson("/iam/credentials", "{\"subject\":\"pat\",\"roles\":[\"reader\"]}", null);
+
+        // 会话汇总：2 个有效会话，代次 0
+        mvc.perform(get("/iam/accounts/pat/sessions"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.activeCount").value(2))
+                .andExpect(jsonPath("$.revocationEpoch").value(0))
+                .andExpect(jsonPath("$.sessions[0].credentialId").isString());
+
+        // 一键吊销全部登录：整体成功，代次 +1
+        mvc.perform(post("/iam/accounts/pat/revoke-all"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("SUCCESS"))
+                .andExpect(jsonPath("$.revokedCredentialIds.length()").value(2))
+                .andExpect(jsonPath("$.revocationEpoch").value(1));
+
+        // 返回后两条凭证都不再放行（401 CREDENTIAL_REVOKED）
+        for (JsonNode cred : new JsonNode[]{c1, c2}) {
+            mvc.perform(post("/iam/access").contentType(MediaType.APPLICATION_JSON)
+                            .header("Authorization", bearer(cred))
+                            .content("{\"resource\":\"docs/a\",\"action\":\"read\"}"))
+                    .andExpect(status().isUnauthorized())
+                    .andExpect(jsonPath("$.error").value("CREDENTIAL_REVOKED"));
+        }
+
+        // 汇总收敛：activeCount=0，代次与吊销返回一致
+        mvc.perform(get("/iam/accounts/pat/sessions"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.activeCount").value(0))
+                .andExpect(jsonPath("$.revocationEpoch").value(1));
+
+        // 重复执行：幂等成功，本次无新增吊销，两条识别为 alreadyRevoked
+        mvc.perform(post("/iam/accounts/pat/revoke-all"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.revokedCredentialIds.length()").value(0))
+                .andExpect(jsonPath("$.alreadyRevokedCredentialIds.length()").value(2))
+                .andExpect(jsonPath("$.revocationEpoch").value(2));
+
+        // 无凭证账号 -> 404 NO_ACTIVE_CREDENTIALS（与 503 系统故障可区分）
+        mvc.perform(post("/iam/accounts/ghost/revoke-all"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("NO_ACTIVE_CREDENTIALS"));
+
+        // 审计不可写 -> 503 AUDIT_UNAVAILABLE，且不留中间态
+        JsonNode c3 = postJson("/iam/credentials", "{\"subject\":\"quinn\",\"roles\":[\"reader\"]}", null);
+        mvc.perform(post("/test/audit-writable/false")).andExpect(status().isOk());
+        mvc.perform(post("/iam/accounts/quinn/revoke-all"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.error").value("AUDIT_UNAVAILABLE"));
+        mvc.perform(post("/test/audit-writable/true")).andExpect(status().isOk());
+        // 状态未被部分修改：凭证仍有效，恢复后可正常访问
+        mvc.perform(post("/iam/access").contentType(MediaType.APPLICATION_JSON)
+                        .header("Authorization", bearer(c3))
+                        .content("{\"resource\":\"docs/a\",\"action\":\"read\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.allowed").value(true));
+    }
 }

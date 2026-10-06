@@ -135,6 +135,60 @@ public class CredentialServiceImpl implements CredentialService {
                 "revoked; stateChanged=" + changed + "; credentialVersion=" + view.version());
     }
 
+    @Override
+    public BulkRevokeResult revokeAllForSubject(String subject) {
+        if (subject == null || subject.isBlank()) {
+            throw new IamException(ErrorCode.MALFORMED_REQUEST, "subject is required");
+        }
+        BulkRevokeResult result = store.revokeAllBySubject(subject, clock.nowMillis(),
+                plan -> auditService.record(buildBulkRevokeEvent(plan)));
+        switch (result.status()) {
+            case SUCCESS:
+                log.info("bulk revoke committed: subject={}, revoked={}, alreadyRevoked={}, expired={}, epoch={}",
+                        subject, result.revokedCredentialIds(), result.alreadyRevokedCredentialIds(),
+                        result.expiredCredentialIds(), result.revocationEpoch());
+                return result;
+            case NO_CREDENTIALS:
+                log.info("bulk revoke rejected: subject={} has no credentials", subject);
+                throw new IamException(ErrorCode.NO_ACTIVE_CREDENTIALS);
+            case AUDIT_FAILED:
+                // 审计不可写：整体失败，存储层未做任何状态变更，调用方可安全重试。
+                log.error("bulk revoke fail-closed: audit unavailable, subject={}", subject);
+                throw new IamException(ErrorCode.AUDIT_UNAVAILABLE);
+            default:
+                throw new IamException(ErrorCode.INTERNAL_ERROR);
+        }
+    }
+
+    @Override
+    public AccountSessionSummary sessionsOf(String subject) {
+        if (subject == null || subject.isBlank()) {
+            throw new IamException(ErrorCode.MALFORMED_REQUEST, "subject is required");
+        }
+        AccountSessionSummary summary = store.summarizeSubject(subject, clock.nowMillis());
+        log.info("session summary: subject={}, activeCount={}, epoch={}",
+                subject, summary.activeCount(), summary.revocationEpoch());
+        return summary;
+    }
+
+    private AuditEvent buildBulkRevokeEvent(BulkRevokeResult plan) {
+        return new AuditEvent(
+                "evt_" + UUID.randomUUID(),
+                clock.nowMillis(),
+                "REVOKE_ALL",
+                null,
+                plan.subject(),
+                null,
+                null,
+                AuditOutcome.ALLOW,
+                "REVOKE_ALL",
+                "revoked=" + plan.revokedCredentialIds()
+                        + "; alreadyRevoked=" + plan.alreadyRevokedCredentialIds()
+                        + "; expired=" + plan.expiredCredentialIds()
+                        + "; revocationEpoch=" + plan.revocationEpoch(),
+                -1L);
+    }
+
     private void audit(Credential c, String operation, AuditOutcome outcome,
                        String reasonCode, String detail) {
         AuditEvent event = new AuditEvent(

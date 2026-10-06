@@ -75,6 +75,50 @@ mvn spring-boot:run
 
 凭证认证判定优先级：**存在性 → 撤销 → 过期 → 状态有效**。
 
+### 2.4 账号级凭证治理（一键结束全部登录 + 会话汇总）
+
+在单个凭证生命周期之上，提供账号（subject）维度的处置能力：
+
+- **一键吊销** `POST /iam/accounts/{subject}/revoke-all`：一次操作吊销该账号当前
+  **所有仍生效**的凭证。刷新派生的后代凭证与祖先共用 `credentialId`（同一条凭证链），
+  按 id 吊销天然覆盖整条链。
+- **会话汇总** `GET /iam/accounts/{subject}/sessions`：列出该账号当前仍有效的
+  会话（`ACTIVE` 且未过期），并带处置代次，便于确认处置是否已收敛。
+
+#### 批量吊销的结果语义
+
+响应为 `BulkRevokeResult`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `status` | `SUCCESS` / `NO_CREDENTIALS` / `AUDIT_FAILED`（后两者经 HTTP 错误码体现） |
+| `revokedCredentialIds` | 本次操作**新吊销**的凭证 id |
+| `alreadyRevokedCredentialIds` | 之前就已吊销的凭证 id（被**识别**出来，不算漏网或误报） |
+| `expiredCredentialIds` | 已过期的凭证 id（同上，无需吊销） |
+| `revocationEpoch` | 该账号的处置代次，每次成功的批量吊销 +1 |
+
+- **幂等可重复**：再次执行时全部凭证被识别为 `alreadyRevoked`/`expired`，
+  本次 `revoked` 为空，状态保持稳定，操作仍整体成功。
+- **与并发刷新/访问交错时结果确定**：归类、审计、应用吊销在存储变更锁内串行完成。
+  操作返回后，该账号不存在仍生效的凭证，新访问一律 `CREDENTIAL_REVOKED`；
+  在途刷新要么先完成（新密文随即被同一次操作吊销），要么撞上已吊销状态失败，
+  **不可能**出现“旧凭证已吊销、又被一次刷新续出新的有效凭证”。
+- **整体成功或整体失败**：审计记录先于状态变更写入；审计写不进去时不留
+  “吊销了一半”的中间态（凭证全部保持原状、代次不变），对外返回
+  `AUDIT_UNAVAILABLE`（503），不透出底层细节，调用方可安全重试。
+- **失败原因可区分**：账号名下没有任何凭证 → `NO_ACTIVE_CREDENTIALS`（404，
+  可忽略）；系统侧一时不可用 → `AUDIT_UNAVAILABLE`（503，应重试）。
+
+#### 会话汇总的含义
+
+响应为 `AccountSessionSummary`：`{subject, activeCount, sessions[], revocationEpoch, asOfMillis}`。
+
+- `sessions[]` 只含**当前有效**会话（`credentialId`、`issuedAt`、`expiresAt`、`version`），
+  历史累积的已吊销/已过期凭证不列入；汇总开销与活跃会话数相关，账号历史凭证再多
+  也不会拖慢该查询，且只读路径不持有存储变更锁，不阻塞正常访问与刷新。
+- `revocationEpoch` 是可辨识的收敛标识：批量吊销返回后代次 +1，汇总中的代次与
+  吊销返回一致且 `activeCount=0`，即可确认处置已收敛。
+
 ---
 
 ## 3. 授权判定（RBAC + ABAC）
@@ -111,9 +155,9 @@ mvn spring-boot:run
 
 ## 4. 审计链路与失败语义
 
-- 所有凭证生命周期操作（ISSUE / REFRESH / REVOKE）与每次 ACCESS 判定都生成不可变
-  `AuditEvent`，记录输入（主体、资源、动作）与**完整判定依据**（命中策略 id、策略修订号、
-  凭证版本、拒绝原因）。
+- 所有凭证生命周期操作（ISSUE / REFRESH / REVOKE / REVOKE_ALL）与每次 ACCESS 判定都生成
+  不可变 `AuditEvent`，记录输入（主体、资源、动作）与**完整判定依据**（命中策略 id、
+  策略修订号、凭证版本、拒绝原因；批量吊销记录三类凭证清单与处置代次）。
 - 审计存储基于 `CopyOnWriteArrayList`，原子追加，**并发下记录不丢失、事件 id 唯一**，
   可通过 `GET /iam/audit` 完整还原判定过程；查询返回防御性拷贝，不可篡改。
 - **审计不可写时，受保护操作失败关闭**：本应放行的请求返回 `AUDIT_UNAVAILABLE`（503），
@@ -145,6 +189,8 @@ mvn spring-boot:run
 | `POST /iam/credentials` | 签发凭证，body：`{subject, roles?, ttlMillis?}`（默认 1 小时） |
 | `POST /iam/credentials/refresh` | 刷新轮换，Header：`Authorization: Bearer <secret>` |
 | `POST /iam/credentials/{id}/revoke` | 撤销凭证 |
+| `POST /iam/accounts/{subject}/revoke-all` | 一键吊销该账号全部有效凭证（整体成功或整体失败） |
+| `GET  /iam/accounts/{subject}/sessions` | 查看该账号当前有效会话与处置代次 |
 | `POST /iam/access` | 访问判定，body：`{resource, action}`，Header：Bearer |
 | `POST /iam/policies` | 新增/更新策略，body：`{policyId, effect(ALLOW/DENY), resourcePrefix, action, anyOfRoles?, attributeEquals?}` |
 | `POST /iam/subjects` | 设置主体属性，body：`{subject, attributes}` |
@@ -200,6 +246,26 @@ curl -i -XPOST $BASE/iam/access -H "Authorization: Bearer $SECRET" \
   -H 'Content-Type: application/json' -d '{"resource":"docs/a","action":"read"}'
 curl -s -XPOST $BASE/test/audit-writable/true
 
+# 账号级治理：再给 alice 签一条凭证，查看当前会话（含处置代次）
+curl -s -XPOST $BASE/iam/credentials -H 'Content-Type: application/json'   -d '{"subject":"alice","roles":["reader"]}'
+curl -s $BASE/iam/accounts/alice/sessions
+
+# 一键结束 alice 全部登录：返回本次吊销/已吊销/已过期分类与代次
+curl -s -XPOST $BASE/iam/accounts/alice/revoke-all
+# 返回后 alice 的任何凭证都不再放行（401 CREDENTIAL_REVOKED）
+curl -i -XPOST $BASE/iam/access -H "Authorization: Bearer $NEWSECRET" \
+  -H 'Content-Type: application/json' -d '{"resource":"docs/a","action":"read"}'
+# 汇总收敛：activeCount=0，revocationEpoch 与吊销返回一致
+curl -s $BASE/iam/accounts/alice/sessions
+# 重复执行幂等：revoked 为空，全部识别为 alreadyRevoked
+curl -s -XPOST $BASE/iam/accounts/alice/revoke-all
+# 无凭证账号 -> 404 NO_ACTIVE_CREDENTIALS（与 503 系统故障可区分）
+curl -i -XPOST $BASE/iam/accounts/ghost/revoke-all
+# 审计不可写 -> 整体失败 503 AUDIT_UNAVAILABLE，不留中间态，恢复后可重试
+curl -s -XPOST $BASE/test/audit-writable/false
+curl -i -XPOST $BASE/iam/accounts/alice/revoke-all
+curl -s -XPOST $BASE/test/audit-writable/true
+
 # 查看审计链
 curl -s $BASE/iam/audit
 ```
@@ -214,12 +280,13 @@ curl -s $BASE/iam/audit
 | `CredentialRevocationRaceTest` | 撤销与 24 路在途访问交错；撤销/刷新 200 次竞态迭代；REVOKED/EXPIRED/INVALID 可区分 |
 | `AuthorizationPolicyTest` | 显式 DENY 优先、默认拒绝、RBAC/ABAC 命中、策略与属性变更按修订边界收敛、依赖故障失败关闭 |
 | `AuditFailureTest` | 审计不可写时失败关闭（503）、拒绝原因不被覆盖、32 路并发审计不丢重且 id 唯一、审计只读不可篡改 |
-| `WebEndToEndTest` | 经 MockMvc 验证各 HTTP 入口状态码与错误码一致、响应不泄露底层细节 |
+| `AccountRevocationTest` | 账号级批量吊销：含轮换后代、过期/已吊销识别、重复执行稳定、无凭证与系统故障可区分、审计失败整体回退、与并发刷新/访问交错的确定性、会话汇总收敛 |
+| `WebEndToEndTest` | 经 MockMvc 验证各 HTTP 入口状态码与错误码一致、响应不泄露底层细节；含账号级治理端点 |
 
 测试通过 `ManualClock` 可控推进时间以**确定性地触发过期**，不依赖真实等待；
 日志中会打印每次判定的**输入与判定依据**（`log.info / log.warn`，见 surefire 输出）。
 所有测试均为内存态、不依赖任何外部服务或真实凭据。
 
 ```bash
-mvn -Dtest=CredentialRefreshConcurrencyTest,CredentialRevocationRaceTest,AuthorizationPolicyTest,AuditFailureTest test
+mvn -Dtest=CredentialRefreshConcurrencyTest,CredentialRevocationRaceTest,AuthorizationPolicyTest,AuditFailureTest,AccountRevocationTest test
 ```
