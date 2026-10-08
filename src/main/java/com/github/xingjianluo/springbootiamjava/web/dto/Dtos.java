@@ -41,7 +41,9 @@ public final class Dtos {
 
     public record BatchRevocationResponse(String operationId, String subject, int revokedCount,
                                           int alreadyRevokedCount, int expiredCount,
-                                          List<String> revokedCredentialIds) {
+                                          List<String> revokedCredentialIds,
+                                          List<String> alreadyRevokedCredentialIds,
+                                          List<String> expiredCredentialIds) {
     }
 
     public record SessionViewDto(String credentialId, long version, long issuedAt, long expiresAt) {

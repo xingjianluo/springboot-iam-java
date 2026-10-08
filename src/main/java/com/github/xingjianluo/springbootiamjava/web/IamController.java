@@ -85,7 +85,8 @@ public class IamController {
         BatchRevocationResult result = accountGovernanceService.revokeAllForSubject(subject);
         return new BatchRevocationResponse(result.operationId(), result.subject(),
                 result.revokedCount(), result.alreadyRevokedCount(), result.expiredCount(),
-                result.revokedCredentialIds());
+                result.revokedCredentialIds(), result.alreadyRevokedCredentialIds(),
+                result.expiredCredentialIds());
     }
 
     @GetMapping("/iam/accounts/{subject}/sessions")

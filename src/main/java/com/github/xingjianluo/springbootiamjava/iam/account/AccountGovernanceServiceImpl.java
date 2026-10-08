@@ -5,6 +5,7 @@ import com.github.xingjianluo.springbootiamjava.iam.audit.AuditOutcome;
 import com.github.xingjianluo.springbootiamjava.iam.audit.AuditService;
 import com.github.xingjianluo.springbootiamjava.iam.credential.BatchRevokeOutcome;
 import com.github.xingjianluo.springbootiamjava.iam.credential.CredentialStore;
+import com.github.xingjianluo.springbootiamjava.iam.credential.RevokePlan;
 import com.github.xingjianluo.springbootiamjava.iam.credential.StoredCredential;
 import com.github.xingjianluo.springbootiamjava.iam.error.ErrorCode;
 import com.github.xingjianluo.springbootiamjava.iam.error.IamException;
@@ -55,10 +56,11 @@ public class AccountGovernanceServiceImpl implements AccountGovernanceService {
         String operationId = "op_" + UUID.randomUUID();
         long now = clock.nowMillis();
 
-        BatchRevokeOutcome outcome = store.revokeAllBySubject(subject, now, toRevoke -> {
+        BatchRevokeOutcome outcome = store.revokeAllBySubject(subject, now, plan -> {
             // 审计钩子在存储变更锁内执行：写不进去则整体不落变更。
-            AuditEvent event = buildEvent(operationId, subject, toRevoke, AuditOutcome.ALLOW,
-                    "REVOKE_ALL", detail(operationId, toRevoke, 0, 0));
+            // 审计内容直接取自存储层分类计划，三类数量与 id 和本次真实分类逐条一致。
+            AuditEvent event = buildEvent(operationId, subject, AuditOutcome.ALLOW,
+                    "REVOKE_ALL", detail(plan));
             boolean ok = auditService.record(event);
             if (!ok) {
                 log.error("revoke-all fail-closed: audit unavailable, subject={}, operationId={}",
@@ -74,11 +76,14 @@ public class AccountGovernanceServiceImpl implements AccountGovernanceService {
         if (outcome.revoked().isEmpty()) {
             log.info("revoke-all no-op: subject={}, operationId={}, alreadyRevoked={}, expired={}",
                     subject, operationId, outcome.alreadyRevoked(), outcome.expired());
-            // 尽力留痕（拒绝结论不依赖审计可用性）。
-            auditService.record(buildEvent(operationId, subject, List.of(), AuditOutcome.DENIED_INVALID,
+            // 尽力留痕（拒绝结论不依赖审计可用性）；同样带上三类的可辨识 id，便于对账。
+            auditService.record(buildEvent(operationId, subject, AuditOutcome.DENIED_INVALID,
                     ErrorCode.NO_ACTIVE_CREDENTIALS.name(),
-                    "no active credentials; alreadyRevoked=" + outcome.alreadyRevoked()
-                            + "; expired=" + outcome.expired()));
+                    "no active credentials; revokedCount=0; revokedIds=[]"
+                            + "; alreadyRevoked=" + outcome.alreadyRevoked()
+                            + "; alreadyRevokedIds=" + outcome.alreadyRevokedIds()
+                            + "; expired=" + outcome.expired()
+                            + "; expiredIds=" + outcome.expiredIds()));
             throw new IamException(ErrorCode.NO_ACTIVE_CREDENTIALS);
         }
 
@@ -87,7 +92,8 @@ public class AccountGovernanceServiceImpl implements AccountGovernanceService {
                 subject, operationId, revokedIds.size(), outcome.alreadyRevoked(),
                 outcome.expired(), revokedIds);
         return new BatchRevocationResult(operationId, subject, revokedIds.size(),
-                outcome.alreadyRevoked(), outcome.expired(), revokedIds);
+                outcome.alreadyRevoked(), outcome.expired(), revokedIds,
+                outcome.alreadyRevokedIds(), outcome.expiredIds());
     }
 
     @Override
@@ -110,7 +116,7 @@ public class AccountGovernanceServiceImpl implements AccountGovernanceService {
         return summary;
     }
 
-    private AuditEvent buildEvent(String operationId, String subject, List<Credential> revoked,
+    private AuditEvent buildEvent(String operationId, String subject,
                                   AuditOutcome outcome, String reasonCode, String detail) {
         return new AuditEvent(
                 "evt_" + UUID.randomUUID(),
@@ -126,10 +132,20 @@ public class AccountGovernanceServiceImpl implements AccountGovernanceService {
                 -1L);
     }
 
-    private static String detail(String operationId, List<Credential> revoked,
-                                 int alreadyRevoked, int expired) {
-        List<String> ids = revoked.stream().map(Credential::credentialId).toList();
-        return "revokedCount=" + ids.size() + "; revokedIds=" + ids
-                + "; alreadyRevoked=" + alreadyRevoked + "; expired=" + expired;
+    /**
+     * 批量吊销审计明细：三类各自的数量 + 稳定 id 列表，与接口返回一一对应，
+     * 可与会话汇总（仍有效的 credentialId）互相核对处置是否收敛。
+     */
+    private static String detail(RevokePlan plan) {
+        List<String> revokedIds = plan.toRevoke().stream().map(Credential::credentialId).toList();
+        List<String> alreadyRevokedIds = plan.alreadyRevoked().stream()
+                .map(Credential::credentialId).toList();
+        List<String> expiredIds = plan.expired().stream()
+                .map(Credential::credentialId).toList();
+        return "revokedCount=" + revokedIds.size() + "; revokedIds=" + revokedIds
+                + "; alreadyRevoked=" + alreadyRevokedIds.size()
+                + "; alreadyRevokedIds=" + alreadyRevokedIds
+                + "; expired=" + expiredIds.size()
+                + "; expiredIds=" + expiredIds;
     }
 }

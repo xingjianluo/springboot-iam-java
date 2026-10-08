@@ -111,32 +111,40 @@ public class InMemoryCredentialStore implements CredentialStore {
 
     @Override
     public BatchRevokeOutcome revokeAllBySubject(String subject, long nowMillis,
-                                                 Function<List<Credential>, Boolean> auditHook) {
+                                                 Function<RevokePlan, Boolean> auditHook) {
         synchronized (mutationLock) {
             // 与 rotate/revoke 同一把锁：批量吊销与并发刷新、并发单点撤销串行，
             // 返回之后该主体不可能再有凭证被放行或被刷新续期。
             List<StoredCredential> toRevoke = new ArrayList<>();
             List<Credential> toRevokeViews = new ArrayList<>();
-            int alreadyRevoked = 0;
-            int expired = 0;
+            List<Credential> alreadyRevokedViews = new ArrayList<>();
+            List<Credential> expiredViews = new ArrayList<>();
             for (StoredCredential stored : findBySubject(subject)) {
                 Credential view = stored.view();
                 if (view.status() == CredentialStatus.REVOKED) {
-                    alreadyRevoked++;
+                    alreadyRevokedViews.add(view);
                 } else if (nowMillis > view.expiresAt()) {
                     // 已过期：识别出来，不计入吊销，避免误报。
-                    expired++;
+                    expiredViews.add(view);
                 } else {
                     toRevoke.add(stored);
                     toRevokeViews.add(view);
                 }
             }
+            RevokePlan plan = new RevokePlan(List.copyOf(toRevokeViews),
+                    List.copyOf(alreadyRevokedViews), List.copyOf(expiredViews));
+            List<String> alreadyRevokedIds = alreadyRevokedViews.stream()
+                    .map(Credential::credentialId).toList();
+            List<String> expiredIds = expiredViews.stream()
+                    .map(Credential::credentialId).toList();
             if (toRevoke.isEmpty()) {
-                // 没有有效凭证：无需审计钩子，整体无变更，由上层映射为可区分原因。
-                return new BatchRevokeOutcome(List.of(), alreadyRevoked, expired, true);
+                // 没有有效凭证：无需审计钩子，整体无变更，由上层映射为可区分原因；
+                // 分类结果（含 id）照常返回，供上层留痕与对账。
+                return new BatchRevokeOutcome(List.of(), alreadyRevokedIds, expiredIds, true);
             }
-            // 先审计后变更：审计钩子拒绝则一个都不改，绝不留下“吊销一半”的中间态。
-            if (auditHook != null && !Boolean.TRUE.equals(auditHook.apply(toRevokeViews))) {
+            // 先审计后变更：审计钩子拿到完整分类计划；钩子拒绝则一个都不改，
+            // 绝不留下“吊销一半”的中间态。
+            if (auditHook != null && !Boolean.TRUE.equals(auditHook.apply(plan))) {
                 return BatchRevokeOutcome.rolledBack();
             }
             List<Credential> revokedViews = new ArrayList<>(toRevoke.size());
@@ -144,7 +152,8 @@ public class InMemoryCredentialStore implements CredentialStore {
                 stored.revoke();
                 revokedViews.add(stored.view());
             }
-            return new BatchRevokeOutcome(List.copyOf(revokedViews), alreadyRevoked, expired, true);
+            return new BatchRevokeOutcome(List.copyOf(revokedViews),
+                    alreadyRevokedIds, expiredIds, true);
         }
     }
 

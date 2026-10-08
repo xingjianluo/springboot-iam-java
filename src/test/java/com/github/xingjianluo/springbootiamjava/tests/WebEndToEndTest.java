@@ -157,6 +157,31 @@ class WebEndToEndTest {
         JsonNode batch = postJson("/iam/accounts/tina/revoke-all", "", null);
         org.assertj.core.api.Assertions.assertThat(batch.get("revokedCount").asInt()).isEqualTo(2);
         org.assertj.core.api.Assertions.assertThat(batch.get("operationId").asText()).isNotBlank();
+        // 三类 id 列表字段均存在，可与审计记录互相核对
+        org.assertj.core.api.Assertions.assertThat(batch.get("revokedCredentialIds").size()).isEqualTo(2);
+        org.assertj.core.api.Assertions.assertThat(batch.get("alreadyRevokedCredentialIds").size()).isEqualTo(0);
+        org.assertj.core.api.Assertions.assertThat(batch.get("expiredCredentialIds").size()).isEqualTo(0);
+
+        // 审计链中的本次操作记录：三类数量与接口返回一致，operationId 可对应
+        MvcResult auditResult = mvc.perform(get("/iam/audit"))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode events = json.readTree(auditResult.getResponse().getContentAsString());
+        JsonNode batchEvent = null;
+        for (JsonNode e : events) {
+            if ("REVOKE_ALL".equals(e.get("operation").asText())
+                    && e.get("decisionDetail").asText()
+                        .contains(batch.get("operationId").asText())) {
+                batchEvent = e;
+            }
+        }
+        org.assertj.core.api.Assertions.assertThat(batchEvent).isNotNull();
+        org.assertj.core.api.Assertions.assertThat(batchEvent.get("decisionDetail").asText())
+                .contains("revokedCount=2")
+                .contains("alreadyRevoked=0")
+                .contains("expired=0")
+                .contains("revokedIds=")
+                .contains("alreadyRevokedIds=")
+                .contains("expiredIds=");
 
         // 3) 吊销后：含刷新派生的最新密文，全部 401 CREDENTIAL_REVOKED
         for (JsonNode cred : new JsonNode[]{c1, c2v1}) {

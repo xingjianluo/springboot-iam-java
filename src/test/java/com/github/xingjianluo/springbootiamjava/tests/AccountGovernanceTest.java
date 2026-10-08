@@ -124,6 +124,71 @@ class AccountGovernanceTest {
                 .reduce((a, b) -> b).orElseThrow();
         assertThat(batchEvent.subject()).isEqualTo("ivy");
         assertThat(batchEvent.decisionDetail()).contains(result.operationId());
+
+        // 审计里的三类数量与接口返回逐一对应（修复点：不再恒为 0）。
+        assertThat(batchEvent.decisionDetail())
+                .contains("revokedCount=" + result.revokedCount())
+                .contains("alreadyRevoked=" + result.alreadyRevokedCount())
+                .contains("expired=" + result.expiredCount());
+        // 三类各自的可辨识标识也与接口返回、与实际签发的凭证一一对应。
+        assertThat(parseIds(batchEvent.decisionDetail(), "revokedIds"))
+                .containsExactlyInAnyOrderElementsOf(result.revokedCredentialIds());
+        assertThat(parseIds(batchEvent.decisionDetail(), "alreadyRevokedIds"))
+                .containsExactly(preRevoked.credentialId());
+        assertThat(parseIds(batchEvent.decisionDetail(), "expiredIds"))
+                .containsExactly(expired.credentialId());
+        assertThat(result.alreadyRevokedCredentialIds())
+                .containsExactly(preRevoked.credentialId());
+        assertThat(result.expiredCredentialIds())
+                .containsExactly(expired.credentialId());
+    }
+
+    @Test
+    void revokeAll_auditClassification_matchesInterfaceReturn_forMixedAccount() {
+        // 混合账号：2 条仍有效 + 1 条事先单独吊销 + 1 条已过期。
+        Credential active1 = credentialService.issue("mix", List.of(), 600_000L);
+        Credential active2 = credentialService.issue("mix", List.of(), 600_000L);
+        Credential preRevoked = credentialService.issue("mix", List.of(), 600_000L);
+        credentialService.revoke(preRevoked.credentialId());
+        Credential expired = credentialService.issue("mix", List.of(), 5_000L);
+        clock.advance(6_000L);
+        log.info("input: subject=mix, active=[{},{}], preRevoked={}, expired={}",
+                active1.credentialId(), active2.credentialId(),
+                preRevoked.credentialId(), expired.credentialId());
+
+        BatchRevocationResult result = governance.revokeAllForSubject("mix");
+        AuditEvent event = audit.findAll().stream()
+                .filter(e -> e.operation().equals("REVOKE_ALL")
+                        && e.decisionDetail().contains(result.operationId()))
+                .findFirst().orElseThrow();
+        log.info("basis: response revokedCount={}, alreadyRevoked={}, expired={}; audit detail={}",
+                result.revokedCount(), result.alreadyRevokedCount(),
+                result.expiredCount(), event.decisionDetail());
+
+        // 审计分类与接口返回一致：数量与三类 id 列表逐条对得上。
+        assertThat(event.outcome().name()).isEqualTo("ALLOW");
+        assertThat(event.decisionDetail())
+                .contains("revokedCount=2")
+                .contains("alreadyRevoked=1")
+                .contains("expired=1");
+        assertThat(parseIds(event.decisionDetail(), "revokedIds"))
+                .containsExactlyInAnyOrder(active1.credentialId(), active2.credentialId());
+        assertThat(parseIds(event.decisionDetail(), "alreadyRevokedIds"))
+                .containsExactly(preRevoked.credentialId());
+        assertThat(parseIds(event.decisionDetail(), "expiredIds"))
+                .containsExactly(expired.credentialId());
+        // 接口返回的三类 id 列表与审计一致，且互不混入。
+        assertThat(result.revokedCredentialIds())
+                .containsExactlyInAnyOrder(active1.credentialId(), active2.credentialId());
+        assertThat(result.alreadyRevokedCredentialIds())
+                .containsExactly(preRevoked.credentialId());
+        assertThat(result.expiredCredentialIds()).containsExactly(expired.credentialId());
+        // 三类标识互不重叠，可分别与账号登录情况查询核对。
+        assertThat(result.revokedCredentialIds())
+                .doesNotContainAnyElementsOf(result.alreadyRevokedCredentialIds())
+                .doesNotContainAnyElementsOf(result.expiredCredentialIds());
+        // 处置收敛：会话清零，审计里的 revokedIds 覆盖吊销前的全部有效会话。
+        assertThat(governance.sessionsOf("mix").activeCount()).isZero();
     }
 
     @Test
@@ -230,8 +295,8 @@ class AccountGovernanceTest {
 
     @Test
     void revokeAll_isRepeatable_secondCallReportsNoActiveCredentials() {
-        credentialService.issue("liam", List.of(), 600_000L);
-        credentialService.issue("liam", List.of(), 600_000L);
+        Credential k1 = credentialService.issue("liam", List.of(), 600_000L);
+        Credential k2 = credentialService.issue("liam", List.of(), 600_000L);
 
         BatchRevocationResult first = governance.revokeAllForSubject("liam");
         assertThat(first.revokedCount()).isEqualTo(2);
@@ -248,6 +313,21 @@ class AccountGovernanceTest {
         assertThat(second).isEqualTo(ErrorCode.NO_ACTIVE_CREDENTIALS);
         assertThat(governance.sessionsOf("liam").activeCount()).isZero();
 
+        // 重复执行的审计留痕同样可区分：本次吊销 0 条（不凭空记数），
+        // 两条凭证归入“操作前已吊销”并带可辨识 id。
+        AuditEvent repeatEvent = audit.findAll().stream()
+                .filter(e -> e.operation().equals("REVOKE_ALL"))
+                .reduce((a, b) -> b).orElseThrow();
+        log.info("basis: repeat audit outcome={}, detail={}",
+                repeatEvent.outcome(), repeatEvent.decisionDetail());
+        assertThat(repeatEvent.decisionDetail())
+                .contains("revokedCount=0")
+                .contains("alreadyRevoked=2")
+                .contains("expired=0");
+        assertThat(parseIds(repeatEvent.decisionDetail(), "revokedIds")).isEmpty();
+        assertThat(parseIds(repeatEvent.decisionDetail(), "alreadyRevokedIds"))
+                .containsExactlyInAnyOrder(k1.credentialId(), k2.credentialId());
+
         ErrorCode third = null;
         try {
             governance.revokeAllForSubject("liam");
@@ -263,14 +343,27 @@ class AccountGovernanceTest {
         assertThat(revokeAllExpect("nobody")).isEqualTo(ErrorCode.NO_ACTIVE_CREDENTIALS);
 
         // 场景二：凭证全部已过期。
-        credentialService.issue("olga", List.of(), 5_000L);
+        Credential olgaCred = credentialService.issue("olga", List.of(), 5_000L);
         clock.advance(6_000L);
         assertThat(revokeAllExpect("olga")).isEqualTo(ErrorCode.NO_ACTIVE_CREDENTIALS);
+        // 留痕可区分：expired=1 且带 id，revokedCount=0（不凭空记成本次吊销）。
+        AuditEvent olgaEvent = latestRevokeAllEvent();
+        log.info("basis: olga audit detail={}", olgaEvent.decisionDetail());
+        assertThat(olgaEvent.decisionDetail())
+                .contains("revokedCount=0").contains("alreadyRevoked=0").contains("expired=1");
+        assertThat(parseIds(olgaEvent.decisionDetail(), "expiredIds"))
+                .containsExactly(olgaCred.credentialId());
 
         // 场景三：凭证全部已吊销。
         Credential c = credentialService.issue("pat", List.of(), 600_000L);
         credentialService.revoke(c.credentialId());
         assertThat(revokeAllExpect("pat")).isEqualTo(ErrorCode.NO_ACTIVE_CREDENTIALS);
+        AuditEvent patEvent = latestRevokeAllEvent();
+        log.info("basis: pat audit detail={}", patEvent.decisionDetail());
+        assertThat(patEvent.decisionDetail())
+                .contains("revokedCount=0").contains("alreadyRevoked=1").contains("expired=0");
+        assertThat(parseIds(patEvent.decisionDetail(), "alreadyRevokedIds"))
+                .containsExactly(c.credentialId());
 
         // 场景四：审计不可用 -> 系统侧失败，原因码与上面三类完全不同。
         credentialService.issue("quinn", List.of(), 600_000L);
@@ -301,11 +394,23 @@ class AccountGovernanceTest {
         assertThat(summary.activeCount()).isEqualTo(2);
         assertThat(accessExpect(c1.secret())).isNull();
         assertThat(accessExpect(c2.secret())).isNull();
+        // 审计写不进去时一条都不改，且审计链里不会留下半成品的批量吊销记录。
+        assertThat(audit.findAll().stream()
+                .filter(e -> e.operation().equals("REVOKE_ALL")))
+                .isEmpty();
 
         // 审计恢复后重试成功，且只吊销一次（结果稳定收敛）。
         BatchRevocationResult retry = governance.revokeAllForSubject("ruth");
         assertThat(retry.revokedCount()).isEqualTo(2);
         assertThat(governance.sessionsOf("ruth").activeCount()).isZero();
+        // 恢复后的审计分类与返回一致。
+        AuditEvent recovered = latestRevokeAllEvent();
+        assertThat(recovered.decisionDetail())
+                .contains("revokedCount=2")
+                .contains("alreadyRevoked=0")
+                .contains("expired=0");
+        assertThat(parseIds(recovered.decisionDetail(), "revokedIds"))
+                .containsExactlyInAnyOrderElementsOf(retry.revokedCredentialIds());
     }
 
     @Test
@@ -361,5 +466,25 @@ class AccountGovernanceTest {
         } catch (IamException e) {
             return e.errorCode();
         }
+    }
+
+    /** 审计链中最近一条批量吊销事件。 */
+    private AuditEvent latestRevokeAllEvent() {
+        return audit.findAll().stream()
+                .filter(e -> e.operation().equals("REVOKE_ALL"))
+                .reduce((a, b) -> b).orElseThrow();
+    }
+
+    /** 从审计明细文本中解析 {@code key=[id1, id2]} 形式的 id 列表。 */
+    private static List<String> parseIds(String detail, String key) {
+        String marker = key + "=[";
+        int start = detail.indexOf(marker);
+        assertThat(start).as("detail contains %s", marker).isGreaterThanOrEqualTo(0);
+        int end = detail.indexOf(']', start);
+        String body = detail.substring(start + marker.length(), end).trim();
+        if (body.isEmpty()) {
+            return List.of();
+        }
+        return List.of(body.split(",\\s*"));
     }
 }
