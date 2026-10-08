@@ -196,6 +196,53 @@ class WebEndToEndTest {
     }
 
     @Test
+    void accountRevokeAll_auditTrailClassification_matchesResponseOverHttp() throws Exception {
+        postJson("/iam/policies",
+                "{\"policyId\":\"p\",\"effect\":\"ALLOW\",\"resourcePrefix\":\"docs/\",\"action\":\"read\",\"anyOfRoles\":[\"reader\"]}",
+                null);
+        // 4 条凭证：2 条有效（其中 1 条再刷新一代）、1 条提前吊销、1 条等待过期。
+        JsonNode c1 = postJson("/iam/credentials",
+                "{\"subject\":\"zoe\",\"roles\":[\"reader\"]}", null);
+        JsonNode c2 = postJson("/iam/credentials",
+                "{\"subject\":\"zoe\",\"roles\":[\"reader\"]}", null);
+        postJson("/iam/credentials/refresh", "", bearer(c1));
+        JsonNode preRevoked = postJson("/iam/credentials",
+                "{\"subject\":\"zoe\",\"roles\":[\"reader\"]}", null);
+        JsonNode expired = postJson("/iam/credentials",
+                "{\"subject\":\"zoe\",\"roles\":[\"reader\"],\"ttlMillis\":50}", null);
+        postJson("/iam/credentials/" + preRevoked.get("credentialId").asText() + "/revoke",
+                "", null);
+        Thread.sleep(60); // expired 凭证确定过期
+
+        JsonNode batch = postJson("/iam/accounts/zoe/revoke-all", "", null);
+        org.assertj.core.api.Assertions.assertThat(batch.get("revokedCount").asInt()).isEqualTo(2);
+        org.assertj.core.api.Assertions.assertThat(batch.get("alreadyRevokedCount").asInt())
+                .isEqualTo(1);
+        org.assertj.core.api.Assertions.assertThat(batch.get("expiredCount").asInt()).isEqualTo(1);
+        String operationId = batch.get("operationId").asText();
+
+        // 审计链（经 HTTP 查询）中本次事件的三类数量与 id 与响应一一对应。
+        MvcResult auditResult = mvc.perform(get("/iam/audit"))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode events = json.readTree(auditResult.getResponse().getContentAsString());
+        JsonNode batchEvent = null;
+        for (JsonNode e : events) {
+            if ("REVOKE_ALL".equals(e.path("operation").asText())
+                    && e.path("decisionDetail").asText().contains("operationId=" + operationId + ";")) {
+                batchEvent = e;
+            }
+        }
+        org.assertj.core.api.Assertions.assertThat(batchEvent).isNotNull();
+        String detail = batchEvent.get("decisionDetail").asText();
+        org.assertj.core.api.Assertions.assertThat(detail)
+                .contains("revokedCount=2", "alreadyRevokedCount=1", "expiredCount=1")
+                .contains("alreadyRevokedIds=[" + preRevoked.get("credentialId").asText() + "]")
+                .contains("expiredIds=[" + expired.get("credentialId").asText() + "]")
+                .contains(c1.get("credentialId").asText())
+                .contains(c2.get("credentialId").asText());
+    }
+
+    @Test
     void malformedPolicy_is400_withSafeMessage() throws Exception {
         mvc.perform(post("/iam/policies").contentType(MediaType.APPLICATION_JSON)
                         .content("{\"policyId\":\"x\"}"))

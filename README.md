@@ -98,12 +98,43 @@ mvn spring-boot:run
 - **可辨识标识**：每次批量操作生成 `operationId`，同时写入响应与审计事件
   （`operation=REVOKE_ALL`），便于事后核对处置是否已收敛。
 
+#### 2.4.1 批量吊销的审计记录与接口返回怎么一一对应
+
+每次 `revoke-all` 都会在存储变更锁内、落状态变更**之前**写一条 `REVOKE_ALL` 审计事件
+（`AuditEvent`），记录的就是本次操作真实的锁内分类结果。`decisionDetail` 中三类
+**各自同时给出数量与凭证稳定 id 列表**，字段名固定、可解析，与响应字段一一对应：
+
+| 审计字段（decisionDetail） | 对应响应字段 | 含义 |
+| --- | --- | --- |
+| `revokedCount` / `revokedIds` | `revokedCount` / `revokedCredentialIds` | 本次实际吊销了哪几条（吊销前仍有效） |
+| `alreadyRevokedCount` / `alreadyRevokedIds` | `alreadyRevokedCount` | 操作之前就已吊销的是哪几条（识别，不重复计入） |
+| `expiredCount` / `expiredIds` | `expiredCount` | 操作之前就已过期的是哪几条（识别，不计入吊销） |
+
+此外事件上还有：
+
+- `subject`：账号主体；`operationId`：本次操作唯一标识（也在响应里），重复执行的每次调用
+  都有各自独立的 `operationId` 与独立事件，可逐次区分；
+- `outcome` / `reasonCode`：有凭证被吊销时为 `ALLOW` / `REVOKE_ALL`；账号当前无有效凭证时
+  为 `DENIED_INVALID` / `NO_ACTIVE_CREDENTIALS`，此时审计中 `revokedCount=0`、
+  `revokedIds=[]`，**不会凭空记成本次吊销了几条**，识别出的“已吊销/已过期”两类仍照常记录。
+
+三类 id 互不相交，合起来恰好覆盖该账号名下的全部凭证；用这些 id 可与
+`GET /iam/accounts/{subject}/sessions`（处置前有效会话）及单凭证状态互相核对，确认处置已收敛。
+审计写不进去时（`AUDIT_UNAVAILABLE`，503）该事件不会产生，凭证状态也一个都不改。
+
 响应示例：
 
 ```json
 {"operationId":"op_…","subject":"alice","revokedCount":2,
  "alreadyRevokedCount":1,"expiredCount":1,
  "revokedCredentialIds":["cred_…","cred_…"]}
+```
+
+对应审计事件 `decisionDetail` 示例：
+
+```text
+operationId=op_…; revokedCount=2; revokedIds=[cred_a, cred_b]; alreadyRevokedCount=1;
+alreadyRevokedIds=[cred_c]; expiredCount=1; expiredIds=[cred_d]
 ```
 
 ### 2.5 账号会话汇总（查看当前登录情况）
@@ -161,6 +192,8 @@ mvn spring-boot:run
 - 所有凭证生命周期操作（ISSUE / REFRESH / REVOKE）与每次 ACCESS 判定都生成不可变
   `AuditEvent`，记录输入（主体、资源、动作）与**完整判定依据**（命中策略 id、策略修订号、
   凭证版本、拒绝原因）。
+- 账号级批量吊销（`REVOKE_ALL`）的审计事件额外记录本次操作的三类分类**数量与 id 列表**
+  （本次吊销 / 操作前已吊销 / 操作前已过期），与接口返回一一对应，详见 §2.4.1。
 - 审计存储基于 `CopyOnWriteArrayList`，原子追加，**并发下记录不丢失、事件 id 唯一**，
   可通过 `GET /iam/audit` 完整还原判定过程；查询返回防御性拷贝，不可篡改。
 - **审计不可写时，受保护操作失败关闭**：本应放行的请求返回 `AUDIT_UNAVAILABLE`（503），
@@ -260,9 +293,16 @@ curl -s -XPOST $BASE/iam/credentials -H 'Content-Type: application/json' \
 curl -s $BASE/iam/accounts/alice/sessions
 # 一键结束全部登录（响应含 operationId 与各计数）
 curl -s -XPOST $BASE/iam/accounts/alice/revoke-all
+# 审计对账：列出所有 REVOKE_ALL 事件的 operationId 与三类分类明细，
+# 最近一条的 revokedCount/revokedIds/alreadyRevoked*/expired* 应与上面的响应一一对应
+curl -s $BASE/iam/audit | python3 -c 'import sys,json
+for e in json.load(sys.stdin):
+    if e["operation"]=="REVOKE_ALL":
+        print(e["outcome"], e["decisionDetail"])'
 # 确认收敛（activeCount=0）
 curl -s $BASE/iam/accounts/alice/sessions
-# 重复执行 -> 404 NO_ACTIVE_CREDENTIALS（可忽略，非系统故障）
+# 重复执行 -> 404 NO_ACTIVE_CREDENTIALS（可忽略，非系统故障）；
+# 对应审计事件 revokedCount=0、revokedIds=[]，两条凭证记入 alreadyRevokedIds
 curl -i -XPOST $BASE/iam/accounts/alice/revoke-all
 # 审计不可用 -> 503 AUDIT_UNAVAILABLE，且一个凭证都不会被改（整体失败）
 curl -s -XPOST $BASE/iam/credentials -H 'Content-Type: application/json' \
@@ -283,8 +323,8 @@ curl -s $BASE/iam/accounts/bob/sessions   # activeCount 仍为 1
 | `CredentialRevocationRaceTest` | 撤销与 24 路在途访问交错；撤销/刷新 200 次竞态迭代；REVOKED/EXPIRED/INVALID 可区分 |
 | `AuthorizationPolicyTest` | 显式 DENY 优先、默认拒绝、RBAC/ABAC 命中、策略与属性变更按修订边界收敛、依赖故障失败关闭 |
 | `AuditFailureTest` | 审计不可写时失败关闭（503）、拒绝原因不被覆盖、32 路并发审计不丢重且 id 唯一、审计只读不可篡改 |
-| `AccountGovernanceTest` | 批量吊销与并发刷新（100 次竞态迭代）/并发访问交错、重复吊销、无有效凭证、审计不可用整体失败、会话汇总收敛与不阻塞 |
-| `WebEndToEndTest` | 经 MockMvc 验证各 HTTP 入口状态码与错误码一致、响应不泄露底层细节；含批量吊销的 404/503 可区分与原子性 |
+| `AccountGovernanceTest` | 批量吊销与并发刷新（100 次竞态迭代 + 混合账号交错）/并发访问交错、**审计三类分类（数量+id）与接口返回一致**、重复吊销逐次可区分、无有效凭证（无凭证/全过期/全吊销）审计不凭空记吊销、审计不可用整体失败且不留审计、会话汇总收敛与不阻塞 |
+| `WebEndToEndTest` | 经 MockMvc 验证各 HTTP 入口状态码与错误码一致、响应不泄露底层细节；含批量吊销的 404/503 可区分与原子性、**经 HTTP 核对审计分类与响应一致** |
 
 测试通过 `ManualClock` 可控推进时间以**确定性地触发过期**，不依赖真实等待；
 日志中会打印每次判定的**输入与判定依据**（`log.info / log.warn`，见 surefire 输出）。

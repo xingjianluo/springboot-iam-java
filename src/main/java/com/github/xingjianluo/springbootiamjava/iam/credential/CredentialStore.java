@@ -33,16 +33,17 @@ public interface CredentialStore {
     boolean revoke(String credentialId);
 
     /**
-     * 账号级批量吊销：在同一把变更锁内先对待吊销清单执行审计钩子，
-     * 钩子接受（返回 true）才落变更；钩子拒绝则一个都不改（整体失败，无中间态）。
+     * 账号级批量吊销：在同一把变更锁内先对账号名下全部凭证完成确定性分类（本次待吊销 /
+     * 操作前已吊销 / 操作前已过期），再把完整分类快照交给审计钩子；钩子接受（返回 true）
+     * 才落变更；钩子拒绝则一个都不改（整体失败，无中间态）。
      * 与并发 rotate/revoke 由同一把锁串行，返回后该主体不存在仍可用的凭证。
      *
      * @param subject    账号主体
      * @param nowMillis  当前时间，用于锁内过期判定
-     * @param auditHook  入参为本次将吊销的凭证当前视图；返回 false 表示审计不可用
+     * @param auditHook  入参为锁内分类快照（含三类各自的数量与凭证 id）；返回 false 表示审计不可用
      */
     BatchRevokeOutcome revokeAllBySubject(String subject, long nowMillis,
-                                          Function<List<Credential>, Boolean> auditHook);
+                                          Function<RevocationPlan, Boolean> auditHook);
 
     /** 测试/本地验证支持：清空。 */
     void clear();

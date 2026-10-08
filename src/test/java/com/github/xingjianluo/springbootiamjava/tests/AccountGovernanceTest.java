@@ -7,6 +7,7 @@ import com.github.xingjianluo.springbootiamjava.iam.account.AccountGovernanceSer
 import com.github.xingjianluo.springbootiamjava.iam.account.BatchRevocationResult;
 import com.github.xingjianluo.springbootiamjava.iam.account.SessionSummary;
 import com.github.xingjianluo.springbootiamjava.iam.audit.AuditEvent;
+import com.github.xingjianluo.springbootiamjava.iam.audit.AuditOutcome;
 import com.github.xingjianluo.springbootiamjava.iam.audit.InMemoryAuditService;
 import com.github.xingjianluo.springbootiamjava.iam.authz.DefaultPolicyEvaluator;
 import com.github.xingjianluo.springbootiamjava.iam.authz.InMemoryAuthzStore;
@@ -19,14 +20,19 @@ import com.github.xingjianluo.springbootiamjava.iam.model.Credential;
 import com.github.xingjianluo.springbootiamjava.iam.model.Policy;
 import com.github.xingjianluo.springbootiamjava.iam.model.PolicyEffect;
 import com.github.xingjianluo.springbootiamjava.tests.support.ManualClock;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -119,11 +125,33 @@ class AccountGovernanceTest {
         assertThat(after.activeCount()).isZero();
 
         // 审计链中有本次批量操作，operationId 可对应。
-        AuditEvent batchEvent = audit.findAll().stream()
-                .filter(e -> e.operation().equals("REVOKE_ALL"))
-                .reduce((a, b) -> b).orElseThrow();
+        AuditEvent batchEvent = eventForOperation(result.operationId());
         assertThat(batchEvent.subject()).isEqualTo("ivy");
+        assertThat(batchEvent.outcome()).isEqualTo(AuditOutcome.ALLOW);
         assertThat(batchEvent.decisionDetail()).contains(result.operationId());
+
+        // 核心断言：审计里的三类数量与 id 必须和接口返回、会话查询严格一一对应，
+        // 不能只给笼统数字，也不能把几类混在一起。
+        Map<String, String> detail = parseDetail(batchEvent);
+        log.info("audit basis: operationId={}, detail={}", result.operationId(),
+                batchEvent.decisionDetail());
+        assertThat(detail.get("revokedCount")).isEqualTo("2");
+        assertThat(parseIds(detail.get("revokedIds")))
+                .containsExactlyInAnyOrder(c1.credentialId(), c2.credentialId())
+                .containsExactlyElementsOf(result.revokedCredentialIds());
+        assertThat(detail.get("alreadyRevokedCount")).isEqualTo("1");
+        assertThat(parseIds(detail.get("alreadyRevokedIds")))
+                .containsExactly(preRevoked.credentialId());
+        assertThat(detail.get("expiredCount")).isEqualTo("1");
+        assertThat(parseIds(detail.get("expiredIds")))
+                .containsExactly(expired.credentialId());
+        // 三类互不相交，合起来覆盖账号名下全部凭证。
+        Set<String> allClassified = new HashSet<>(result.revokedCredentialIds());
+        allClassified.addAll(parseIds(detail.get("alreadyRevokedIds")));
+        allClassified.addAll(parseIds(detail.get("expiredIds")));
+        assertThat(allClassified).containsExactlyInAnyOrder(
+                c1.credentialId(), c2.credentialId(),
+                preRevoked.credentialId(), expired.credentialId());
     }
 
     @Test
@@ -229,6 +257,112 @@ class AccountGovernanceTest {
     }
 
     @Test
+    void revokeAll_repeatedCall_recordsDistinctOperationIds_andClassifiesPreviouslyRevoked() {
+        Credential c1 = credentialService.issue("liam", List.of(), 600_000L);
+        Credential c2 = credentialService.issue("liam", List.of(), 600_000L);
+
+        BatchRevocationResult first = governance.revokeAllForSubject("liam");
+        assertThat(first.revokedCount()).isEqualTo(2);
+
+        ErrorCode second = null;
+        try {
+            governance.revokeAllForSubject("liam");
+        } catch (IamException e) {
+            second = e.errorCode();
+        }
+        log.info("input: repeat revoke-all for liam | basis: first={}, second={}",
+                first.revokedCount(), second);
+        assertThat(second).isEqualTo(ErrorCode.NO_ACTIVE_CREDENTIALS);
+
+        // 两次操作各自有可区分的 operationId 与独立审计事件。
+        AuditEvent firstEvent = eventForOperation(first.operationId());
+        assertThat(firstEvent.outcome()).isEqualTo(AuditOutcome.ALLOW);
+        Map<String, String> firstDetail = parseDetail(firstEvent);
+        assertThat(firstDetail.get("revokedCount")).isEqualTo("2");
+        assertThat(parseIds(firstDetail.get("revokedIds")))
+                .containsExactlyInAnyOrder(c1.credentialId(), c2.credentialId());
+        assertThat(firstDetail.get("alreadyRevokedCount")).isEqualTo("0");
+
+        AuditEvent secondEvent = audit.findAll().stream()
+                .filter(e -> e.operation().equals("REVOKE_ALL"))
+                .filter(e -> !e.decisionDetail().contains(first.operationId()))
+                .reduce((a, b) -> b).orElseThrow();
+        assertThat(secondEvent.decisionDetail()).isNotEqualTo(firstEvent.decisionDetail());
+        assertThat(secondEvent.outcome()).isEqualTo(AuditOutcome.DENIED_INVALID);
+        assertThat(secondEvent.reasonCode()).isEqualTo("NO_ACTIVE_CREDENTIALS");
+        Map<String, String> secondDetail = parseDetail(secondEvent);
+        // 第二次没有凭空记成本次吊销：revoked 恒为 0，两条都归入“操作前已吊销”，可逐 id 核对。
+        log.info("repeat audit basis: secondOperationDetail={}", secondEvent.decisionDetail());
+        assertThat(secondDetail.get("revokedCount")).isEqualTo("0");
+        assertThat(parseIds(secondDetail.get("revokedIds"))).isEmpty();
+        assertThat(secondDetail.get("alreadyRevokedCount")).isEqualTo("2");
+        assertThat(parseIds(secondDetail.get("alreadyRevokedIds")))
+                .containsExactlyInAnyOrder(c1.credentialId(), c2.credentialId());
+        assertThat(secondDetail.get("expiredCount")).isEqualTo("0");
+
+        // 第三次：结论与审计分类保持稳定。
+        ErrorCode third = revokeAllExpect("liam");
+        assertThat(third).isEqualTo(ErrorCode.NO_ACTIVE_CREDENTIALS);
+        long noOpEvents = audit.findAll().stream()
+                .filter(e -> e.operation().equals("REVOKE_ALL")
+                        && e.outcome() == AuditOutcome.DENIED_INVALID).count();
+        assertThat(noOpEvents).isEqualTo(2);
+        assertThat(governance.sessionsOf("liam").activeCount()).isZero();
+    }
+
+    @Test
+    void revokeAll_withNoActiveCredentials_recordsZeroRevoked_withClassifiedIds() {
+        // 场景一：账号从未有凭证 —— 三类全空，绝不凭空记吊销。
+        assertThat(revokeAllExpect("nobody")).isEqualTo(ErrorCode.NO_ACTIVE_CREDENTIALS);
+        AuditEvent nobodyEvent = lastNoOpEvent();
+        Map<String, String> nobodyDetail = parseDetail(nobodyEvent);
+        log.info("input: revoke-all on subject with no credentials | basis: {}",
+                nobodyEvent.decisionDetail());
+        assertThat(nobodyDetail.get("revokedCount")).isEqualTo("0");
+        assertThat(parseIds(nobodyDetail.get("revokedIds"))).isEmpty();
+        assertThat(nobodyDetail.get("alreadyRevokedCount")).isEqualTo("0");
+        assertThat(nobodyDetail.get("expiredCount")).isEqualTo("0");
+
+        // 场景二：凭证全部已过期 —— revoked=0，过期 id 逐条可辨。
+        Credential e1 = credentialService.issue("olga", List.of(), 5_000L);
+        Credential e2 = credentialService.issue("olga", List.of(), 3_000L);
+        clock.advance(6_000L);
+        assertThat(revokeAllExpect("olga")).isEqualTo(ErrorCode.NO_ACTIVE_CREDENTIALS);
+        Map<String, String> olgaDetail = parseDetail(lastNoOpEvent());
+        log.info("input: revoke-all on all-expired subject | basis: {}",
+                lastNoOpEvent().decisionDetail());
+        assertThat(olgaDetail.get("revokedCount")).isEqualTo("0");
+        assertThat(parseIds(olgaDetail.get("revokedIds"))).isEmpty();
+        assertThat(olgaDetail.get("expiredCount")).isEqualTo("2");
+        assertThat(parseIds(olgaDetail.get("expiredIds")))
+                .containsExactlyInAnyOrder(e1.credentialId(), e2.credentialId());
+        assertThat(olgaDetail.get("alreadyRevokedCount")).isEqualTo("0");
+
+        // 场景三：凭证全部已吊销 —— revoked=0，已吊销 id 逐条可辨。
+        Credential r1 = credentialService.issue("pat", List.of(), 600_000L);
+        Credential r2 = credentialService.issue("pat", List.of(), 600_000L);
+        credentialService.revoke(r1.credentialId());
+        credentialService.revoke(r2.credentialId());
+        assertThat(revokeAllExpect("pat")).isEqualTo(ErrorCode.NO_ACTIVE_CREDENTIALS);
+        Map<String, String> patDetail = parseDetail(lastNoOpEvent());
+        log.info("input: revoke-all on all-revoked subject | basis: {}",
+                lastNoOpEvent().decisionDetail());
+        assertThat(patDetail.get("revokedCount")).isEqualTo("0");
+        assertThat(parseIds(patDetail.get("revokedIds"))).isEmpty();
+        assertThat(patDetail.get("alreadyRevokedCount")).isEqualTo("2");
+        assertThat(parseIds(patDetail.get("alreadyRevokedIds")))
+                .containsExactlyInAnyOrder(r1.credentialId(), r2.credentialId());
+        assertThat(patDetail.get("expiredCount")).isEqualTo("0");
+    }
+
+    private AuditEvent lastNoOpEvent() {
+        return audit.findAll().stream()
+                .filter(e -> e.operation().equals("REVOKE_ALL")
+                        && e.outcome() == AuditOutcome.DENIED_INVALID)
+                .reduce((a, b) -> b).orElseThrow();
+    }
+
+    @Test
     void revokeAll_isRepeatable_secondCallReportsNoActiveCredentials() {
         credentialService.issue("liam", List.of(), 600_000L);
         credentialService.issue("liam", List.of(), 600_000L);
@@ -289,11 +423,27 @@ class AccountGovernanceTest {
         Credential c1 = credentialService.issue("ruth", List.of("reader"), 600_000L);
         Credential c2 = credentialService.issue("ruth", List.of("reader"), 600_000L);
 
+        long auditEventsBefore = audit.findAll().size();
         audit.setWritable(false);
-        ErrorCode err = revokeAllExpect("ruth");
+        IamException failure = null;
+        try {
+            governance.revokeAllForSubject("ruth");
+        } catch (IamException e) {
+            failure = e;
+        }
         audit.setWritable(true);
-        log.info("input: revoke-all with audit down | basis: error={}", err);
-        assertThat(err).isEqualTo(ErrorCode.AUDIT_UNAVAILABLE);
+        log.info("input: revoke-all with audit down | basis: error={}",
+                failure == null ? null : failure.errorCode());
+        assertThat(failure).isNotNull();
+        assertThat(failure.errorCode()).isEqualTo(ErrorCode.AUDIT_UNAVAILABLE);
+        // 对外只透出固定安全说明，不带任何底层异常/实现细节。
+        assertThat(failure.getMessage())
+                .isEqualTo(ErrorCode.AUDIT_UNAVAILABLE.publicMessage());
+
+        // 审计里不能凭空出现这次失败操作的 REVOKE_ALL 记录（写不进去就是没写）。
+        List<AuditEvent> eventsAfter = audit.findAll();
+        assertThat(eventsAfter).hasSize((int) auditEventsBefore);
+        assertThat(eventsAfter).noneMatch(e -> e.operation().equals("REVOKE_ALL"));
 
         // 整体失败：不能留下“吊销一半”的中间态——两个凭证都必须仍然有效。
         SessionSummary summary = governance.sessionsOf("ruth");
@@ -302,10 +452,92 @@ class AccountGovernanceTest {
         assertThat(accessExpect(c1.secret())).isNull();
         assertThat(accessExpect(c2.secret())).isNull();
 
-        // 审计恢复后重试成功，且只吊销一次（结果稳定收敛）。
+        // 审计恢复后重试成功，且只吊销一次（结果稳定收敛），审计分类与返回一致。
         BatchRevocationResult retry = governance.revokeAllForSubject("ruth");
         assertThat(retry.revokedCount()).isEqualTo(2);
         assertThat(governance.sessionsOf("ruth").activeCount()).isZero();
+        Map<String, String> retryDetail = parseDetail(eventForOperation(retry.operationId()));
+        assertThat(retryDetail.get("revokedCount")).isEqualTo("2");
+        assertThat(parseIds(retryDetail.get("revokedIds")))
+                .containsExactlyInAnyOrderElementsOf(retry.revokedCredentialIds());
+        assertThat(retryDetail.get("alreadyRevokedCount")).isEqualTo("0");
+        assertThat(retryDetail.get("expiredCount")).isEqualTo("0");
+    }
+
+    @Test
+    void revokeAll_interleavedWithConcurrentRefresh_auditClassificationMatchesResult()
+            throws Exception {
+        allowDocsRead("reader");
+        // 混合账号：2 条持续被并发刷新的有效凭证 + 1 条已吊销 + 1 条已过期。
+        Credential c1 = credentialService.issue("nora", List.of("reader"), 600_000L);
+        Credential c2 = credentialService.issue("nora", List.of("reader"), 600_000L);
+        Credential preRevoked = credentialService.issue("nora", List.of("reader"), 600_000L);
+        Credential expired = credentialService.issue("nora", List.of("reader"), 5_000L);
+        credentialService.revoke(preRevoked.credentialId());
+        clock.advance(6_000L);
+
+        final int refreshThreads = 8;
+        CyclicBarrier barrier = new CyclicBarrier(refreshThreads + 1);
+        ExecutorService pool = Executors.newFixedThreadPool(refreshThreads);
+        CountDownLatch done = new CountDownLatch(refreshThreads);
+        ConcurrentLinkedQueue<String> refreshOutcomes = new ConcurrentLinkedQueue<>();
+        for (int i = 0; i < refreshThreads; i++) {
+            final String secret = (i % 2 == 0) ? c1.secret() : c2.secret();
+            pool.submit(() -> {
+                try {
+                    barrier.await();
+                    // 与批量吊销交错地反复尝试刷新；返回后再尝试的应被 REVOKED 拒绝。
+                    for (int k = 0; k < 20; k++) {
+                        refreshOutcomes.add(String.valueOf(refreshExpect(secret)));
+                    }
+                } catch (Exception ignored) {
+                    // 屏障中断等不参与统计
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        barrier.await();
+        BatchRevocationResult result = governance.revokeAllForSubject("nora");
+        assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
+        pool.shutdownNow();
+
+        log.info("input: subject=nora, refreshThreads={}, mixed credentials(2 active + 1 revoked + 1 expired)",
+                refreshThreads);
+        log.info("basis: operationId={}, revoked={}, alreadyRevoked={}, expired={}, refreshOutcomeSample={}",
+                result.operationId(), result.revokedCredentialIds(),
+                result.alreadyRevokedCount(), result.expiredCount(),
+                refreshOutcomes.stream().limit(8).toList());
+
+        // 接口返回：并发刷新即使在交错中成功，两条有效凭证链仍由同一次批量吊销收敛。
+        assertThat(result.revokedCount()).isEqualTo(2);
+        assertThat(result.revokedCredentialIds())
+                .containsExactlyInAnyOrder(c1.credentialId(), c2.credentialId());
+        assertThat(result.alreadyRevokedCount()).isEqualTo(1);
+        assertThat(result.expiredCount()).isEqualTo(1);
+
+        // 审计与返回严格一致，且三类 id 互不混淆。
+        Map<String, String> detail = parseDetail(eventForOperation(result.operationId()));
+        assertThat(detail.get("revokedCount")).isEqualTo("2");
+        assertThat(parseIds(detail.get("revokedIds")))
+                .containsExactlyInAnyOrderElementsOf(result.revokedCredentialIds());
+        assertThat(detail.get("alreadyRevokedCount")).isEqualTo("1");
+        assertThat(parseIds(detail.get("alreadyRevokedIds")))
+                .containsExactly(preRevoked.credentialId());
+        assertThat(detail.get("expiredCount")).isEqualTo("1");
+        assertThat(parseIds(detail.get("expiredIds")))
+                .containsExactly(expired.credentialId());
+
+        // 确定性：返回之后账号会话清零，任何密文都不再放行/续期。
+        // 原密文在交错中若已被轮换，则表现为 INVALID_CREDENTIAL；两种结果都不再可用。
+        assertThat(governance.sessionsOf("nora").activeCount()).isZero();
+        assertThat(accessExpect(c1.secret()))
+                .isIn(ErrorCode.CREDENTIAL_REVOKED, ErrorCode.INVALID_CREDENTIAL);
+        assertThat(accessExpect(c2.secret()))
+                .isIn(ErrorCode.CREDENTIAL_REVOKED, ErrorCode.INVALID_CREDENTIAL);
+        assertThat(refreshExpect(c1.secret()))
+                .isIn(ErrorCode.CREDENTIAL_REVOKED, ErrorCode.INVALID_CREDENTIAL,
+                        ErrorCode.REFRESH_CONFLICT);
     }
 
     @Test
@@ -361,5 +593,42 @@ class AccountGovernanceTest {
         } catch (IamException e) {
             return e.errorCode();
         }
+    }
+
+    /** 按 operationId 精确取出本次批量吊销的审计事件（重复执行也不会串）。 */
+    private AuditEvent eventForOperation(String operationId) {
+        return audit.findAll().stream()
+                .filter(e -> e.operation().equals("REVOKE_ALL")
+                        && e.decisionDetail().contains("operationId=" + operationId + ";"))
+                .reduce((a, b) -> b).orElseThrow();
+    }
+
+    /** 解析 REVOKE_ALL 审计 decisionDetail 中的 key=value（; 分隔，值截至下一个 key）。 */
+    private static Map<String, String> parseDetail(AuditEvent event) {
+        Map<String, String> map = new java.util.LinkedHashMap<>();
+        Matcher m = Pattern.compile("(\\w+)=").matcher(event.decisionDetail());
+        List<Integer> starts = new java.util.ArrayList<>();
+        List<String> keys = new java.util.ArrayList<>();
+        while (m.find()) {
+            starts.add(m.start());
+            keys.add(m.group(1));
+        }
+        for (int i = 0; i < keys.size(); i++) {
+            int valueStart = starts.get(i) + keys.get(i).length() + 1;
+            int valueEnd = (i + 1 < keys.size()) ? starts.get(i + 1) : event.decisionDetail().length();
+            String value = event.decisionDetail().substring(valueStart, valueEnd)
+                    .replaceAll(";\\s*$", "").trim();
+            map.put(keys.get(i), value);
+        }
+        return map;
+    }
+
+    /** 解析 [id1, id2] 形态的 id 列表；空列表返回空集合。 */
+    private static List<String> parseIds(String rendered) {
+        String body = rendered.replaceAll("^\\[", "").replaceAll("]$", "").trim();
+        if (body.isEmpty()) {
+            return List.of();
+        }
+        return Arrays.stream(body.split(",")).map(String::trim).toList();
     }
 }
